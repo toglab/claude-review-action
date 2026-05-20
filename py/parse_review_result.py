@@ -14,6 +14,10 @@ ACCEPTED_BODY = os.environ.get(
     "Review aceita. Nenhum problema bloqueante encontrado.",
 )
 COMMENTS_BODY = os.environ.get("COMMENTS_REVIEW_BODY", "Claude inline review.")
+CONFIDENCE_THRESHOLD = int(os.environ.get("CONFIDENCE_THRESHOLD", "70"))
+# When 1 (default), approves the PR on clean reviews via GitHub's APPROVE event.
+# This ONLY approves — it NEVER merges. Merging is always a human decision.
+APPROVE_ON_ACCEPT = os.environ.get("APPROVE_ON_ACCEPT", "1") == "1"
 
 
 def read_json(path: str) -> tuple[dict[str, Any], str | None, str]:
@@ -51,21 +55,56 @@ def extract_anthropic_text(data: dict[str, Any], raw: str) -> str:
 
 
 def extract_json_object(text: str) -> tuple[dict[str, Any], str | None]:
+    """Extract the review JSON from Claude's response.
+
+    Tries multiple strategies so a stray preamble/postamble never silently
+    causes the review to be treated as "accepted".
+    """
     text = (text or "").strip()
     if not text:
         return {"status": "accepted", "comments": []}, "EMPTY_RESULT"
 
-    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
-    if fenced:
-        text = fenced.group(1).strip()
+    def _try_parse(s: str) -> dict[str, Any] | None:
+        try:
+            value = json.loads(s)
+            return value if isinstance(value, dict) else None
+        except Exception:
+            return None
 
-    try:
-        value = json.loads(text)
-        if isinstance(value, dict):
-            return value, None
-        return {"status": "accepted", "comments": []}, "COMMENT_JSON_NOT_OBJECT"
-    except Exception as exc:  # noqa: BLE001
-        return {"status": "accepted", "comments": []}, f"COMMENT_JSON_PARSE_FAILED: {exc}"
+    # Strategy 1: fenced code block (```json ... ``` or ``` ... ```)
+    fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, flags=re.DOTALL)
+    if fenced:
+        result = _try_parse(fenced.group(1).strip())
+        if result is not None:
+            return result, None
+
+    # Strategy 2: bracket-counting — find every top-level {...} in the text,
+    # prefer the largest one that has a "status" key (our review JSON).
+    candidates: list[str] = []
+    depth = 0
+    start = -1
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start != -1:
+                candidates.append(text[start : i + 1])
+                start = -1
+
+    for candidate in sorted(candidates, key=len, reverse=True):
+        result = _try_parse(candidate)
+        if result is not None and "status" in result:
+            return result, None
+
+    # Strategy 3: parse the whole stripped text as-is
+    result = _try_parse(text)
+    if result is not None:
+        return result, None
+
+    return {"status": "accepted", "comments": []}, f"COMMENT_JSON_PARSE_FAILED: no valid JSON object found in response (length={len(text)})"
 
 
 def main() -> int:
@@ -119,6 +158,12 @@ def main() -> int:
         side = str(item.get("side") or "RIGHT").strip().upper()
         body = str(item.get("body") or "").strip()
 
+        # Parse confidence as integer (supports both numeric and legacy string values)
+        try:
+            confidence_value = int(float(str(item.get("confidence") or 0)))
+        except (TypeError, ValueError):
+            confidence_value = 0
+
         try:
             line = int(item.get("line"))
         except Exception:  # noqa: BLE001
@@ -131,16 +176,28 @@ def main() -> int:
         if side not in {"LEFT", "RIGHT"}:
             discarded_comments.append({"reason": "invalid_side", "comment": item})
             continue
+        if confidence_value < CONFIDENCE_THRESHOLD:
+            discarded_comments.append({
+                "reason": f"low_confidence ({confidence_value} < {CONFIDENCE_THRESHOLD})",
+                "comment": item,
+            })
+            continue
         if (path, line, side) not in valid_targets:
             discarded_comments.append({"reason": "target_not_in_diff", "comment": item})
             continue
-
         if (path, line, side) in seen_targets:
             discarded_comments.append({"reason": "duplicate_target", "comment": item})
             continue
 
         seen_targets.add((path, line, side))
-        valid_comments.append({"path": path, "line": line, "side": side, "body": body})
+        valid_comments.append({
+            "path": path,
+            "line": line,
+            "side": side,
+            "body": body,
+            "confidence": confidence_value,
+            "severity": str(item.get("severity") or "").strip(),
+        })
 
     status = "comments" if valid_comments else "accepted"
     normalized: dict[str, Any] = {"status": status, "comments": valid_comments}
@@ -158,9 +215,28 @@ def main() -> int:
 
     head_sha = pr_data.get("headRefOid") or ""
     review_body = COMMENTS_BODY if valid_comments else ACCEPTED_BODY
-    payload = {"commit_id": head_sha, "event": "COMMENT", "body": review_body}
+
+    # Use APPROVE only when the review is genuinely clean:
+    # - Claude returned "accepted" (no comments)
+    # - Both JSON parses succeeded (no silent fallback to accepted)
+    # - The API call itself succeeded
+    # APPROVE does NOT merge the PR — merging is always a human decision.
+    can_approve = (
+        APPROVE_ON_ACCEPT
+        and status == "accepted"
+        and claude_exit == 0
+        and parse_error is None
+        and comment_parse_error is None
+    )
+    review_event = "APPROVE" if can_approve else "COMMENT"
+
+    payload = {"commit_id": head_sha, "event": review_event, "body": review_body}
     if valid_comments:
-        payload["comments"] = valid_comments
+        # GitHub API only accepts path/line/side/body — strip display-only fields
+        payload["comments"] = [
+            {"path": c["path"], "line": c["line"], "side": c["side"], "body": c["body"]}
+            for c in valid_comments
+        ]
 
     Path(inline_payload_path).write_text(
         json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -168,15 +244,23 @@ def main() -> int:
     Path(count_path).write_text(str(len(valid_comments)), encoding="utf-8")
     Path(status_path).write_text(status, encoding="utf-8")
 
+    low_confidence_count = sum(
+        1 for d in discarded_comments
+        if str(d.get("reason", "")).startswith("low_confidence")
+    )
+
     if valid_comments:
         lines = ["# Inline PR review comments preview", ""]
         for idx, comment in enumerate(valid_comments, start=1):
+            confidence = comment.get("confidence") or "N/A"
+            severity = comment.get("severity") or "N/A"
             lines += [
                 f"### Comment {idx}",
                 f"**File:** {comment['path']}",
                 f"**Line:** {comment['line']}",
                 f"**Side:** {comment['side']}",
-                f"**confidence** {comment['confidence']}",
+                f"**Severity:** {severity}",
+                f"**Confidence:** {confidence}",
                 "",
                 comment["body"],
                 "",
@@ -189,6 +273,21 @@ def main() -> int:
             ]
     else:
         lines = [ACCEPTED_BODY]
+        # Surface any diagnostic info so the user knows why no comments were posted
+        if comment_parse_error:
+            lines += [
+                "",
+                f"⚠️  JSON parse warning: {comment_parse_error}",
+                "    The raw Claude response has been saved to the usage file.",
+                "    Set OUTPUT_DIR=<path> to persist it between runs.",
+            ]
+        elif low_confidence_count:
+            lines += [
+                "",
+                f"ℹ️  {low_confidence_count} comment(s) were generated but discarded",
+                f"   because confidence was below the threshold ({CONFIDENCE_THRESHOLD}/100).",
+                "    Lower CONFIDENCE_THRESHOLD to see them.",
+            ]
 
     Path(review_path).write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
@@ -202,8 +301,11 @@ def main() -> int:
         f.write(f"- Claude JSON parse status: {'FAILED: ' + parse_error if parse_error else 'OK'}\n")
         f.write(f"- Inline comment JSON parse status: {'FAILED: ' + comment_parse_error if comment_parse_error else 'OK'}\n")
         f.write(f"- Review status: {status}\n")
+        f.write(f"- Confidence threshold: {CONFIDENCE_THRESHOLD}/100\n")
+        f.write(f"- Review event: {review_event}\n")
         f.write(f"- Valid inline comments: {len(valid_comments)}\n")
-        f.write(f"- Discarded inline comments: {len(discarded_comments)}\n")
+        f.write(f"- Discarded (low confidence): {low_confidence_count}\n")
+        f.write(f"- Discarded (other reasons): {len(discarded_comments) - low_confidence_count}\n")
         f.write(f"- Claude result subtype: {data.get('subtype', 'not reported')}\n")
         f.write(f"- Claude is_error: {data.get('is_error', 'not reported')}\n")
         f.write(f"- Model: {data.get('model', 'not reported')}\n")
@@ -217,6 +319,11 @@ def main() -> int:
                 f.write(f"- {key}: {value}\n")
         else:
             f.write("- usage: not reported by this API output\n")
+        # Always save the raw response so failures can be diagnosed
+        f.write("\n## Raw Claude response (first 3000 chars)\n\n")
+        f.write("```\n")
+        f.write(review_text[:3000] if review_text else "(empty)")
+        f.write("\n```\n")
 
     return 0
 
