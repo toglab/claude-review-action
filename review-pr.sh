@@ -68,6 +68,9 @@ MAX_CHANGED_FILES_TOTAL_CHARS="${MAX_CHANGED_FILES_TOTAL_CHARS:-120000}"
 CLAUDE_MODEL="${CLAUDE_MODEL:-claude-sonnet-4-6}"
 CLAUDE_MAX_TOKENS="${CLAUDE_MAX_TOKENS:-4096}"
 CONFIDENCE_THRESHOLD="${CONFIDENCE_THRESHOLD:-70}"
+# Set to 0 to disable automatic PR approval on clean reviews.
+# This ONLY approves the PR — it NEVER merges. Merging is always a human decision.
+APPROVE_ON_ACCEPT="${APPROVE_ON_ACCEPT:-1}"
 
 TMP_DIR="$(mktemp -d)"
 cleanup() {
@@ -1119,12 +1122,25 @@ fi
 INLINE_COMMENT_COUNT="$(cat "$TMP_DIR/inline-comment-count.txt" 2>/dev/null || echo "0")"
 
 if [[ "$CLAUDE_EXIT" -eq 0 ]]; then
+  # Read the review event decided by parse_review_result.py
+  REVIEW_EVENT="$(python3 -c "
+import json, sys
+try:
+    p = json.load(open('${INLINE_REVIEW_PAYLOAD_FILE}'))
+    print(p.get('event', 'COMMENT'))
+except Exception:
+    print('COMMENT')
+" 2>/dev/null || echo "COMMENT")"
+
   if [[ "$POST_INLINE_COMMENTS" == "1" ]]; then
     echo ""
-    if [[ "$INLINE_COMMENT_COUNT" != "0" ]]; then
+    if [[ "$REVIEW_EVENT" == "APPROVE" ]]; then
+      echo "✅ Approving PR — no blocking issues found."
+      echo "   ⚠️  This ONLY approves the PR. Merging is always a human decision."
+    elif [[ "$INLINE_COMMENT_COUNT" != "0" ]]; then
       echo "Posting ${INLINE_COMMENT_COUNT} inline review comment(s) to GitHub diff..."
     else
-      echo "Posting accepted review comment to GitHub..."
+      echo "Posting review comment to GitHub..."
     fi
 
     gh api \
@@ -1135,7 +1151,17 @@ if [[ "$CLAUDE_EXIT" -eq 0 ]]; then
       --input "$INLINE_REVIEW_PAYLOAD_FILE" \
       > "$INLINE_REVIEW_RESPONSE_FILE"
 
-    echo "GitHub review posted."
+    if [[ "$REVIEW_EVENT" == "APPROVE" ]]; then
+      echo "PR approved on GitHub."
+    else
+      echo "GitHub review posted."
+    fi
+  elif [[ "$REVIEW_EVENT" == "APPROVE" ]]; then
+    echo ""
+    echo "✅ Clean review — would approve PR (no blocking issues found)."
+    echo "   To post the approval to GitHub, run:"
+    echo "   comment review $API_REPO_SLUG $PR_NUMBER"
+    echo "   ⚠️  This only approves. Merging is always a human decision."
   elif [[ "$INLINE_COMMENT_COUNT" != "0" ]]; then
     echo ""
     echo "Inline comments were generated but not posted."
@@ -1145,8 +1171,8 @@ if [[ "$CLAUDE_EXIT" -eq 0 ]]; then
     echo "comment review $API_REPO_SLUG $PR_NUMBER"
   else
     echo ""
-    echo "Accepted review generated but not posted."
-    echo "To post the accepted review to GitHub, run:"
+    echo "Review generated but not posted."
+    echo "To post to GitHub, run:"
     echo "comment review $API_REPO_SLUG $PR_NUMBER"
   fi
 fi
