@@ -15,9 +15,6 @@ ACCEPTED_BODY = os.environ.get(
 )
 COMMENTS_BODY = os.environ.get("COMMENTS_REVIEW_BODY", "Claude inline review.")
 CONFIDENCE_THRESHOLD = int(os.environ.get("CONFIDENCE_THRESHOLD", "70"))
-# When 1 (default), approves the PR on clean reviews via GitHub's APPROVE event.
-# This ONLY approves — it NEVER merges. Merging is always a human decision.
-APPROVE_ON_ACCEPT = os.environ.get("APPROVE_ON_ACCEPT", "1") == "1"
 
 
 def read_json(path: str) -> tuple[dict[str, Any], str | None, str]:
@@ -215,22 +212,7 @@ def main() -> int:
 
     head_sha = pr_data.get("headRefOid") or ""
     review_body = COMMENTS_BODY if valid_comments else ACCEPTED_BODY
-
-    # Use APPROVE only when the review is genuinely clean:
-    # - Claude returned "accepted" (no comments)
-    # - Both JSON parses succeeded (no silent fallback to accepted)
-    # - The API call itself succeeded
-    # APPROVE does NOT merge the PR — merging is always a human decision.
-    can_approve = (
-        APPROVE_ON_ACCEPT
-        and status == "accepted"
-        and claude_exit == 0
-        and parse_error is None
-        and comment_parse_error is None
-    )
-    review_event = "APPROVE" if can_approve else "COMMENT"
-
-    payload = {"commit_id": head_sha, "event": review_event, "body": review_body}
+    payload = {"commit_id": head_sha, "event": "COMMENT", "body": review_body}
     if valid_comments:
         # GitHub API only accepts path/line/side/body — strip display-only fields
         payload["comments"] = [
@@ -302,7 +284,6 @@ def main() -> int:
         f.write(f"- Inline comment JSON parse status: {'FAILED: ' + comment_parse_error if comment_parse_error else 'OK'}\n")
         f.write(f"- Review status: {status}\n")
         f.write(f"- Confidence threshold: {CONFIDENCE_THRESHOLD}/100\n")
-        f.write(f"- Review event: {review_event}\n")
         f.write(f"- Valid inline comments: {len(valid_comments)}\n")
         f.write(f"- Discarded (low confidence): {low_confidence_count}\n")
         f.write(f"- Discarded (other reasons): {len(discarded_comments) - low_confidence_count}\n")

@@ -19,6 +19,7 @@ runs:
   using: composite
   steps:
     - name: Checkout target repository
+      if: inputs.run_mode != 'reply_review'
       uses: actions/checkout@v4
 
     - name: Validate environment
@@ -29,13 +30,24 @@ runs:
           exit 1
         fi
 
-        if [ -z "${GITHUB_TOKEN:-}" ]; then
-          echo "GITHUB_TOKEN is missing."
+        if [ -z "${GH_TOKEN:-}" ] && [ -z "${GITHUB_TOKEN:-}" ]; then
+          echo "GH_TOKEN or GITHUB_TOKEN is missing."
           exit 1
         fi
 
     - name: Run Claude PR Reviewer
       shell: bash
+      env:
+        # When running inside GitHub Actions, reviews are posted by github-actions[bot].
+        # reply_review.py uses this to find threads started by the bot.
+        REVIEWER_LOGIN: github-actions[bot]
       run: |
         chmod +x "${{ github.action_path }}/review-pr.sh"
-        "${{ github.action_path }}/review-pr.sh" comment review "${{ inputs.repository }}" "${{ inputs.pull_request_number }}"
+        case "${{ inputs.run_mode }}" in
+          reply_review)
+            "${{ github.action_path }}/review-pr.sh" reply review "${{ inputs.repository }}" "${{ inputs.pull_request_number }}"
+            ;;
+          *)
+            "${{ github.action_path }}/review-pr.sh" comment review "${{ inputs.repository }}" "${{ inputs.pull_request_number }}"
+            ;;
+        esac

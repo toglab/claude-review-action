@@ -14,6 +14,10 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 # Replies are conversational — 1024 tokens is plenty.
 CLAUDE_MAX_TOKENS = int(os.environ.get("REPLY_MAX_TOKENS", "1024"))
+# The GitHub login that originally posted the review comments.
+# When reviews were posted by the GitHub Actions bot, set REVIEWER_LOGIN=github-actions[bot].
+# Defaults to the currently authenticated user (for local usage).
+REVIEWER_LOGIN = os.environ.get("REVIEWER_LOGIN", "").strip()
 
 REPLY_SYSTEM_PROMPT = """\
 You are a code reviewer who posted inline comments on a pull request.
@@ -87,7 +91,7 @@ def root_id_of(comment: dict[str, Any], by_id: dict[int, Any]) -> int:
     return parent  # root may be outside our fetched page
 
 
-def build_thread_prompt(thread: list[dict[str, Any]], authed_user: str) -> str:
+def build_thread_prompt(thread: list[dict[str, Any]], reviewer_login: str) -> str:
     """Format the thread as a prompt for Claude."""
     root = thread[0]
     lines: list[str] = [
@@ -112,7 +116,7 @@ def build_thread_prompt(thread: list[dict[str, Any]], authed_user: str) -> str:
 
     for comment in thread:
         author = (comment.get("user") or {}).get("login", "unknown")
-        role = "**You (reviewer):**" if author == authed_user else f"**Developer (@{author}):**"
+        role = "**You (reviewer):**" if author == reviewer_login else f"**Developer (@{author}):**"
         body = (comment.get("body") or "").strip()
         # Truncate very long comment bodies to avoid blowing the context window.
         if len(body) > 2000:
@@ -139,13 +143,24 @@ def main() -> int:
         print("Error: ANTHROPIC_API_KEY is not set.", file=sys.stderr)
         return 1
 
-    # ── Get authenticated GitHub user ──────────────────────────────────────────
-    user_raw, err = gh("api", "user", "--jq", ".login")
-    if not user_raw:
-        print(f"Could not get authenticated GitHub user: {err}", file=sys.stderr)
-        return 1
-    authed_user = user_raw.strip()
-    print(f"Authenticated as: @{authed_user}")
+    # ── Resolve reviewer login ────────────────────────────────────────────────
+    # In GitHub Actions, GITHUB_TOKEN is an installation token and may not be able
+    # to call `gh api user`. In reply mode we already know who posted the original
+    # review comment: usually github-actions[bot].
+    if REVIEWER_LOGIN:
+        authed_user = os.environ.get("GITHUB_ACTOR", "github-actions[bot]").strip() or "github-actions[bot]"
+        reviewer_login = REVIEWER_LOGIN
+        print(f"Running as GitHub actor: @{authed_user}")
+        print(f"Looking for threads by: @{reviewer_login} (REVIEWER_LOGIN override)")
+    else:
+        # Local/dev fallback: only call /user when no explicit reviewer login was provided.
+        user_raw, err = gh("api", "user", "--jq", ".login")
+        if not user_raw:
+            print(f"Could not get authenticated GitHub user: {err}", file=sys.stderr)
+            return 1
+        authed_user = user_raw.strip()
+        reviewer_login = authed_user
+        print(f"Authenticated as: @{authed_user}")
 
     # ── Fetch PR review comments ───────────────────────────────────────────────
     print(f"Fetching review comments for {repo_slug} PR #{pr_number}...")
@@ -174,19 +189,19 @@ def main() -> int:
         rid = root_id_of(comment, by_id)
         threads.setdefault(rid, []).append(comment)
 
-    # ── Find unanswered threads started by us ──────────────────────────────────
+    # ── Find unanswered threads started by the reviewer ───────────────────────
     # Criteria:
-    #   1. Root comment was posted by the authenticated user (us)
-    #   2. Last comment in the thread is NOT from us (user replied, awaiting answer)
+    #   1. Root comment was posted by reviewer_login (the bot or local user)
+    #   2. Last comment in the thread is NOT from reviewer_login (someone replied)
     pending: list[tuple[int, list[dict[str, Any]]]] = []
     for root_id, thread in threads.items():
         root = by_id.get(root_id)
         if root is None:
             continue
-        if (root.get("user") or {}).get("login") != authed_user:
+        if (root.get("user") or {}).get("login") != reviewer_login:
             continue
         last = thread[-1]
-        if (last.get("user") or {}).get("login") == authed_user:
+        if (last.get("user") or {}).get("login") == reviewer_login:
             continue  # we already replied last — thread is current
         pending.append((root_id, thread))
 
@@ -206,7 +221,7 @@ def main() -> int:
         print(f"  Thread on {path}:{line}")
         print(f"    Last reply by: @{last_author}")
 
-        prompt = build_thread_prompt(thread, authed_user)
+        prompt = build_thread_prompt(thread, reviewer_login)
         reply_text = call_claude(prompt)
 
         if reply_text is None:
